@@ -5,6 +5,34 @@ Momentum Contrast for Unsupervised Visual Representation Learning
 """
 
 import tensorflow as tf
+import numpy as np
+from tensorflow.keras.layers import Dense, Flatten, Conv2D
+from tensorflow.keras import Model
+import tensorflow_datasets as tfds
+from tqdm import tqdm
+
+EMBEDDING_DIM = 64
+CLASSES = 8
+IMG_SIZE = 150
+input_shape = (IMG_SIZE, IMG_SIZE, 3)
+BATCH_SIZE = 20
+EPOCHS = 2
+
+
+def RandomAugmentation(input_shape, rotation_range = (-20, 20), scale_range = (0.8, 1.2), padding = 10, bri = 32./255., sat = (0.5, 1.5), hue = .2, con = (0.5, 1.5)):
+    inputs = tf.keras.Input(input_shape[-3:])
+    #results = RandomAffine(inputs.shape[-3:], rotation_range = rotation_range, scale_range = scale_range)(inputs)§
+    results = tf.keras.layers.Lambda(lambda x, p: tf.image.resize(x, [tf.shape(x)[-3] + p, tf.shape(x)[-2] + p], method = tf.image.ResizeMethod.NEAREST_NEIGHBOR), arguments = {'p': padding})(inputs)
+    results = tf.keras.layers.Lambda(lambda x: tf.image.random_crop(x[0], size = tf.shape(x[1])))([results, inputs])
+    results = tf.keras.layers.Lambda(lambda x: tf.image.random_flip_left_right(x))(results)
+    results = tf.keras.layers.Lambda(lambda x: tf.image.random_flip_up_down(x))(results)
+    results = tf.keras.layers.Lambda(lambda x, b: tf.image.random_brightness(x, b), arguments = {'b': bri})(results)
+    results = tf.keras.layers.Lambda(lambda x, a, b: tf.image.random_saturation(x, lower = a, upper = b), arguments = {'a': sat[0], 'b': sat[1]})(results)
+    results = tf.keras.layers.Lambda(lambda x, h: tf.image.random_hue(x, h), arguments = {'h': hue})(results)
+    results = tf.keras.layers.Lambda(lambda x, a, b: tf.image.random_contrast(x, lower = a, upper = b), arguments = {'a': con[0], 'b': con[1]})(results)
+    results = tf.keras.layers.Lambda(lambda x: tf.clip_by_value(x, 0., 1.))(results)
+    results = tf.keras.layers.Lambda(lambda x: tf.math.multiply(tf.math.subtract(x, 0.5), 2.))(results)
+    return tf.keras.Model(inputs = inputs, outputs = results)
 
 
 class MoCoQueue:
@@ -21,24 +49,27 @@ class MoCoQueue:
             self.keys = self.keys[:self.max_queue_length]
 
 
-@tf.function
-def _moco_training_step_inner(x, x_aug, queue, model, model_ema, temperature, optimizer):
+#@tf.function
+def _moco_training_step_inner(x, x_aug, queue, model_query, model_keys, temperature, optimizer):
     N = tf.shape(x)[0]
     K = tf.shape(queue)[0]
     C = tf.shape(queue)[1]
-    k = model_ema(x_aug, training=True)  # no gradient
+    k = model_keys(x_aug, training=True)  # no gradient
     with tf.GradientTape() as tape:
-        q = model(x, training=True)
+        q = model_query(x, training=True)
         l_pos = tf.matmul(tf.reshape(q, [N, 1, C]), tf.reshape(k, [N, C, 1]))
         l_pos = tf.reshape(l_pos, [N, 1])
         l_neg = tf.matmul(tf.reshape(q, [N, C]), tf.reshape(queue, [C, K]))
         logits = tf.concat([l_pos, l_neg], axis=1)
+        # print(l_pos.numpy())
+        # print(l_neg.numpy(), l_neg.numpy().shape)
+        # print('-------')
         labels = tf.zeros([N], dtype="int64")
         loss = tf.reduce_mean(
             tf.losses.sparse_categorical_crossentropy(labels, logits / temperature)
         )
-    gradients = tape.gradient(loss, model.trainable_variables)
-    optimizer.apply_gradients(zip(gradients, model.trainable_variables))
+    gradients = tape.gradient(loss, model_query.trainable_variables)
+    optimizer.apply_gradients(zip(gradients, model_query.trainable_variables))
     return loss, k
 
 
@@ -46,154 +77,112 @@ def moco_training_step(
     x,
     x_aug,
     queue,
-    model,
-    model_ema,
+    model_query,
+    model_keys,
     optimizer,
     temperature=0.07,
     momentum=0.999,
 ):
-    loss, new_keys = _moco_training_step_inner(x, x_aug, queue.keys, model, model_ema,
-        tf.constant(temperature, dtype='float32'), optimizer)
+    loss, new_keys = _moco_training_step_inner(
+        x, x_aug, queue.keys, model_query, model_keys,
+        tf.constant(temperature, dtype='float32'),
+        optimizer
+    )
+
     # update the EMA of the model
-    update_model_via_ema(model, model_ema, momentum)
+    update_model_via_ema(model_query, model_keys, momentum)
     queue.enqueue(new_keys)
     return loss
 
 
 def update_model_via_ema(
-    model, ema_model, momentum, just_trainable_vars=False
+    model_query, model_keys, momentum, just_trainable_vars=False
 ):
     iterable = (
-        zip(model.trainable_variables, ema_model.trainable_variables)
+        zip(model_query.trainable_variables, model_keys.trainable_variables)
         if just_trainable_vars
-        else zip(model.variables, ema_model.variables)
+        else zip(model_query.variables, model_keys.variables)
     )
     for p, p2 in iterable:
         p2.assign(momentum * p2 + (1.0 - momentum) * p)
 
 
-class EmulateMultiGPUBatchNorm(tf.keras.layers.Layer):
-    """Emulates behaviour of batch norm when training on multi GPUs when only a single 
-    GPU is being used. This technique is used in the paper (see heading 'Shuffling BN' 
-    in Section 3.3)."""
+def Encoder(input_shape):
+    inputs = tf.keras.Input(shape=input_shape, name="input")
+    model = tf.keras.applications.MobileNetV2(input_shape=input_shape, include_top = False, weights=None)(inputs)
+    pool = tf.keras.layers.GlobalAveragePooling2D()(model)
+    results = tf.keras.layers.Dense(units = EMBEDDING_DIM, name="embeddings")(pool)
+    results = tf.keras.layers.Lambda(lambda  x: tf.keras.backend.l2_normalize(x,axis=1))(results)
+    return tf.keras.Model(inputs = inputs, outputs = results)
 
-    def __init__(self, num_gpus, axis=1, *args, **kwargs):
-        if axis != 1 and axis != 3:
-            raise NotImplementedError(
-                "Currently, EmulateMultiGPUBatchNorm just supports axis==1 or axis==3"
-            )
-        super(EmulateMultiGPUBatchNorm, self).__init__()
-        # Only can do axis==3 as otherwise will get error:
-        # "InternalError: The CPU implementation of FusedBatchNorm only supports
-        #  NHWC tensor format for now. [Op:FusedBatchNormV3]"
-        self.bn_layer = tf.keras.layers.BatchNormalization(
-            axis=3, *args, **kwargs
-        )
-        self.num_gpus = num_gpus
-        self.axis = axis
+def Predictor(base_model):
+    ouputs = tf.keras.layers.Dense(units = CLASSES, activation="softmax")(base_model.get_layer("embeddings").output)
+    return tf.keras.Model(inputs = base_model.input, outputs = ouputs)
 
-    def call(self, inputs, training=None):
-        # Either NHWC (means axis=3) or NCHW (means axis=1)
-        # First, for reshaping, we need NCHW:
-        if self.axis == 3:
-            inputs = tf.transpose(inputs, [0, 3, 1, 2])
-        input_shape = tf.keras.backend.int_shape(inputs)
-        tensor_input_shape = tf.shape(inputs)
-        reshaped_inputs = self._reshape_into_groups(
-            inputs, input_shape, tensor_input_shape
-        )
-        normalized_inputs = self.bn_layer(reshaped_inputs, training=training)
-        outputs = tf.reshape(normalized_inputs, tensor_input_shape)
-        if self.axis == 3:
-            outputs = tf.transpose(outputs, [0, 2, 3, 1])
-        return outputs
+def parse_function(feature):
+    data = (tf.cast(feature["image"], dtype = tf.float32) / 127.5) - 1
+    label = feature["label"]
+    return data, label
 
-    def _reshape_into_groups(self, inputs, input_shape, tensor_input_shape):
-        # N,C,H,W --> N // G, C * G, H, W
-        group_shape = [tensor_input_shape[i] for i in range(len(input_shape))]
-        group_shape[1] = group_shape[1] * self.num_gpus
-        group_shape[0] = group_shape[0] // self.num_gpus
-        group_shape = tf.stack(group_shape)
-        reshaped_inputs = tf.reshape(inputs, group_shape)
-        # Back to NHWC
-        reshaped_inputs = tf.transpose(reshaped_inputs, [0, 2, 3, 1])
-        return reshaped_inputs
-
-    def get_moving_mean_and_var_for_regular_bn(self):
-        return [
-            tf.reduce_mean(tf.reshape(v, (2, -1)), 0)
-            for v in (self.bn_layer.moving_mean, self.bn_layer.moving_variance)
-        ]
+def format_example(image, label):
+    image = tf.cast(image, tf.float32)
+    image = (image/127.5) - 1
+    image = tf.image.resize(image, (IMG_SIZE, IMG_SIZE))
+    return image, tf.reduce_sum(tf.one_hot([label], CLASSES), axis=0)
 
 
-# if __name__ == "__main__":
-#     x = tf.random.normal([1, 1, 1, 3])
-#     x = tf.tile(x, [8, 1, 1, 1])
-#     x = tf.concat([x[-4:], x[-4:] + tf.random.normal([4, 1, 1, 3]) * 0.05], 0)
-#     bn = EmulateMultiGPUBatchNorm(2, axis=3, momentum=0.0)
-from moco import moco_training_step
+# Load dataset
+trainset = tfds.load(
+            name = 'colorectal_histology',
+            as_supervised=True)
 
-import tensorflow as tf
-
-from tensorflow.keras.layers import Dense, Flatten, Conv2D
-from tensorflow.keras import Model
-
-from moco import MoCoQueue, update_model_via_ema
-
-EMBEDDING_DIM = 64
-queue = MoCoQueue(EMBEDDING_DIM, 256)
-
-mnist = tf.keras.datasets.mnist
-
-(x_train, y_train), (x_test, y_test) = mnist.load_data()
-x_train, x_test = x_train / 127.5 - 1, x_test / 127.5 - 1
-x_train, x_test = [tf.cast(i, 'float32') for i in (x_train, x_test)]
-
-# Add a channels dimension
-x_train = x_train[..., tf.newaxis]
-x_test = x_test[..., tf.newaxis]
-
-train_ds = tf.data.Dataset.from_tensor_slices(
-    (x_train, y_train)).shuffle(10000).batch(2)
-
-test_ds = tf.data.Dataset.from_tensor_slices((x_test, y_test)).batch(32)
-
-class MyModel(Model):
-    def __init__(self):
-        super(MyModel, self).__init__()
-        self.conv1 = Conv2D(32, 3, activation='relu')
-        self.flatten = Flatten()
-        self.d1 = Dense(256, activation='relu')
-        self.d2 = Dense(EMBEDDING_DIM, activation=None)
-
-    def call(self, x):
-        x = self.conv1(x)
-        x = self.flatten(x)
-        x = self.d1(x)
-        return self.d2(x)
+trainset_moco = iter(tfds.load(
+            name = 'colorectal_histology',
+            split = tfds.Split.TRAIN,
+            download = False).repeat(-1).map(parse_function).shuffle(BATCH_SIZE).batch(BATCH_SIZE).prefetch(tf.data.experimental.AUTOTUNE))
 
 # Create an instance of the model
-model = MyModel()
-model_ema = MyModel()
+model_query = Encoder(input_shape)
+model_keys = Encoder(input_shape)
 
 # Initialise the models and make the EMA model 90% similar to the main model
-model(x_train[:1])
-model_ema(x_train[:1])
-update_model_via_ema(model, model_ema, 0.1)
+update_model_via_ema(model_query, model_keys, 0.1)
 
-loss_object = tf.keras.losses.SparseCategoricalCrossentropy()
-
+queue = MoCoQueue(EMBEDDING_DIM, 256)
 optimizer = tf.keras.optimizers.Adam()
+train = trainset['train'].map(format_example).batch(BATCH_SIZE)
 
-train_loss = tf.keras.metrics.Mean(name='train_loss')
-train_accuracy = tf.keras.metrics.SparseCategoricalAccuracy(name='train_accuracy')
-
-test_loss = tf.keras.metrics.Mean(name='test_loss')
-test_accuracy = tf.keras.metrics.SparseCategoricalAccuracy(name='test_accuracy')
-
-EPOCHS = 5
+augmentor = RandomAugmentation(input_shape)
 
 for epoch in range(EPOCHS):
-    for x, y in train_ds:
-        x_aug = x + 0.1 * tf.random.normal(x.shape, dtype='float32')
-        moco_training_step(x, x_aug, queue, model, model_ema, optimizer)
+    batch_x, batch_x_aug = [], []
+    i = 0
+    k = 0
+    with tqdm(total=5000/BATCH_SIZE, ncols=100) as pbar:
+        for x, y in trainset_moco:
+            if i < BATCH_SIZE:
+                #x_aug = x + 0.1 * tf.random.normal(x.shape, dtype='float32')
+                x_aug = augmentor(x)
+                x = augmentor(x)
+                batch_x.append(x)
+                batch_x_aug.append(x_aug)
+                i += 1
+
+            if i == BATCH_SIZE:
+                #print('step')
+                loss = moco_training_step(batch_x, batch_x_aug, queue, model_query, model_keys, optimizer)
+                pbar.set_postfix(loss=loss.numpy())
+                i = 0
+                batch_x, batch_x_aug = [], []
+                pbar.update(2)
+            k += 1
+            if k == 2000:
+                break
+
+# train supervised
+model_p = Predictor(model_keys)
+model_p.compile(optimizer='adam',
+                loss=tf.keras.losses.CategoricalCrossentropy(from_logits=False),
+                metrics=['accuracy'])
+
+model_p.fit(train, epochs=EPOCHS)
