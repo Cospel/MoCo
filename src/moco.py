@@ -10,29 +10,35 @@ from tensorflow.keras.layers import Dense, Flatten, Conv2D
 from tensorflow.keras import Model
 import tensorflow_datasets as tfds
 from tqdm import tqdm
+import time
+from tensorflow.python.keras import backend as K
 
 EMBEDDING_DIM = 64
 CLASSES = 8
 IMG_SIZE = 150
 input_shape = (IMG_SIZE, IMG_SIZE, 3)
-BATCH_SIZE = 20
-EPOCHS = 2
+BATCH_SIZE = 100
+EPOCHS = 50
+SAMPLES = 5000
 
 
-def RandomAugmentation(input_shape, rotation_range = (-20, 20), scale_range = (0.8, 1.2), padding = 10, bri = 32./255., sat = (0.5, 1.5), hue = .2, con = (0.5, 1.5)):
-    inputs = tf.keras.Input(input_shape[-3:])
-    #results = RandomAffine(inputs.shape[-3:], rotation_range = rotation_range, scale_range = scale_range)(inputs)§
-    results = tf.keras.layers.Lambda(lambda x, p: tf.image.resize(x, [tf.shape(x)[-3] + p, tf.shape(x)[-2] + p], method = tf.image.ResizeMethod.NEAREST_NEIGHBOR), arguments = {'p': padding})(inputs)
-    results = tf.keras.layers.Lambda(lambda x: tf.image.random_crop(x[0], size = tf.shape(x[1])))([results, inputs])
-    results = tf.keras.layers.Lambda(lambda x: tf.image.random_flip_left_right(x))(results)
-    results = tf.keras.layers.Lambda(lambda x: tf.image.random_flip_up_down(x))(results)
-    results = tf.keras.layers.Lambda(lambda x, b: tf.image.random_brightness(x, b), arguments = {'b': bri})(results)
-    results = tf.keras.layers.Lambda(lambda x, a, b: tf.image.random_saturation(x, lower = a, upper = b), arguments = {'a': sat[0], 'b': sat[1]})(results)
-    results = tf.keras.layers.Lambda(lambda x, h: tf.image.random_hue(x, h), arguments = {'h': hue})(results)
-    results = tf.keras.layers.Lambda(lambda x, a, b: tf.image.random_contrast(x, lower = a, upper = b), arguments = {'a': con[0], 'b': con[1]})(results)
-    results = tf.keras.layers.Lambda(lambda x: tf.clip_by_value(x, 0., 1.))(results)
-    results = tf.keras.layers.Lambda(lambda x: tf.math.multiply(tf.math.subtract(x, 0.5), 2.))(results)
-    return tf.keras.Model(inputs = inputs, outputs = results)
+class AverageMeter(object):
+    """Computes and stores the average and current value"""
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.val = 0
+        self.avg = 0
+        self.sum = 0
+        self.count = 0
+
+    def update(self, val, n=1):
+        self.val = val
+        self.sum += val * n
+        self.count += n
+        self.avg = self.sum / self.count
 
 
 class MoCoQueue:
@@ -49,7 +55,7 @@ class MoCoQueue:
             self.keys = self.keys[:self.max_queue_length]
 
 
-#@tf.function
+@tf.function(experimental_relax_shapes=True)
 def _moco_training_step_inner(x, x_aug, queue, model_query, model_keys, temperature, optimizer):
     N = tf.shape(x)[0]
     K = tf.shape(queue)[0]
@@ -61,16 +67,14 @@ def _moco_training_step_inner(x, x_aug, queue, model_query, model_keys, temperat
         l_pos = tf.reshape(l_pos, [N, 1])
         l_neg = tf.matmul(tf.reshape(q, [N, C]), tf.reshape(queue, [C, K]))
         logits = tf.concat([l_pos, l_neg], axis=1)
-        # print(l_pos.numpy())
-        # print(l_neg.numpy(), l_neg.numpy().shape)
-        # print('-------')
         labels = tf.zeros([N], dtype="int64")
         loss = tf.reduce_mean(
             tf.losses.sparse_categorical_crossentropy(labels, logits / temperature)
         )
+
     gradients = tape.gradient(loss, model_query.trainable_variables)
     optimizer.apply_gradients(zip(gradients, model_query.trainable_variables))
-    return loss, k
+    return loss, k, logits
 
 
 def moco_training_step(
@@ -80,14 +84,20 @@ def moco_training_step(
     model_query,
     model_keys,
     optimizer,
+    pred_meter_pos, pred_meter_neg, loss_meter,
     temperature=0.07,
     momentum=0.999,
 ):
-    loss, new_keys = _moco_training_step_inner(
+    loss, new_keys, logits = _moco_training_step_inner(
         x, x_aug, queue.keys, model_query, model_keys,
         tf.constant(temperature, dtype='float32'),
         optimizer
     )
+
+    # update some stats
+    pred_meter_pos.update(logits.numpy()[:, 0].mean())
+    pred_meter_neg.update(logits.numpy()[:, 1:].mean())
+    loss_meter.update(loss.numpy())
 
     # update the EMA of the model
     update_model_via_ema(model_query, model_keys, momentum)
@@ -119,10 +129,28 @@ def Predictor(base_model):
     ouputs = tf.keras.layers.Dense(units = CLASSES, activation="softmax")(base_model.get_layer("embeddings").output)
     return tf.keras.Model(inputs = base_model.input, outputs = ouputs)
 
-def parse_function(feature):
-    data = (tf.cast(feature["image"], dtype = tf.float32) / 127.5) - 1
-    label = feature["label"]
-    return data, label
+@tf.function
+def augment(image, padding = 10, bri = 32./255., sat = (0.5, 1.5), hue = .2, con = (0.5, 1.5)):
+    x = image
+    x = tf.image.resize(x, [tf.shape(x)[-3] + padding, tf.shape(x)[-2] + padding], method = tf.image.ResizeMethod.NEAREST_NEIGHBOR)
+    x = tf.image.random_crop(x, size = tf.shape(image))
+    x = tf.image.random_flip_left_right(x)
+    x = tf.image.random_flip_up_down(x)
+    x = tf.image.random_brightness(x, bri)
+    x = tf.image.random_saturation(x, lower = sat[0], upper = sat[1])
+    x = tf.image.random_hue(x, hue)
+    x = tf.image.random_contrast(x, lower = con[0], upper = con[1])
+    #x = tf.clip_by_value(x, -1., 1.)
+    x = tf.math.multiply(tf.math.subtract(x, 0.5), 2.)
+    return x
+
+def parse_function(image, label):
+    data = tf.cast(image, dtype = tf.float32)
+    x = (data / 127.5) - 1
+    x = tf.image.resize(x, (IMG_SIZE, IMG_SIZE))
+    x_aug_1 = augment(x)
+    x_aug_2 = augment(x)
+    return x_aug_1, x_aug_2, label
 
 def format_example(image, label):
     image = tf.cast(image, tf.float32)
@@ -130,16 +158,14 @@ def format_example(image, label):
     image = tf.image.resize(image, (IMG_SIZE, IMG_SIZE))
     return image, tf.reduce_sum(tf.one_hot([label], CLASSES), axis=0)
 
-
 # Load dataset
 trainset = tfds.load(
             name = 'colorectal_histology',
-            as_supervised=True)
+            as_supervised=True)['train'].map(format_example).batch(BATCH_SIZE)
 
 trainset_moco = iter(tfds.load(
             name = 'colorectal_histology',
-            split = tfds.Split.TRAIN,
-            download = False).repeat(-1).map(parse_function).shuffle(BATCH_SIZE).batch(BATCH_SIZE).prefetch(tf.data.experimental.AUTOTUNE))
+            as_supervised=True)['train'].map(parse_function).repeat(EPOCHS).shuffle(SAMPLES, reshuffle_each_iteration=True).batch(BATCH_SIZE).prefetch(200))
 
 # Create an instance of the model
 model_query = Encoder(input_shape)
@@ -147,37 +173,34 @@ model_keys = Encoder(input_shape)
 
 # Initialise the models and make the EMA model 90% similar to the main model
 update_model_via_ema(model_query, model_keys, 0.1)
+optimizer = tf.keras.optimizers.SGD(learning_rate=0.02, momentum=0.9, nesterov=True)# weight_decay=1e-5)
 
-queue = MoCoQueue(EMBEDDING_DIM, 256)
-optimizer = tf.keras.optimizers.Adam()
-train = trainset['train'].map(format_example).batch(BATCH_SIZE)
+queue = MoCoQueue(EMBEDDING_DIM, 1024)
 
-augmentor = RandomAugmentation(input_shape)
+pred_meter_pos = AverageMeter()
+pred_meter_neg = AverageMeter()
+loss_meter = AverageMeter()
 
 for epoch in range(EPOCHS):
-    batch_x, batch_x_aug = [], []
-    i = 0
-    k = 0
-    with tqdm(total=5000/BATCH_SIZE, ncols=100) as pbar:
-        for x, y in trainset_moco:
-            if i < BATCH_SIZE:
-                #x_aug = x + 0.1 * tf.random.normal(x.shape, dtype='float32')
-                x_aug = augmentor(x)
-                x = augmentor(x)
-                batch_x.append(x)
-                batch_x_aug.append(x_aug)
-                i += 1
-
-            if i == BATCH_SIZE:
-                #print('step')
-                loss = moco_training_step(batch_x, batch_x_aug, queue, model_query, model_keys, optimizer)
-                pbar.set_postfix(loss=loss.numpy())
-                i = 0
-                batch_x, batch_x_aug = [], []
-                pbar.update(2)
-            k += 1
-            if k == 2000:
+    with tqdm(total=SAMPLES/BATCH_SIZE, ncols=200) as pbar:
+        i = 0
+        for x1, x2, y in trainset_moco:
+            start = time.time()
+            loss = moco_training_step(x1, x2, queue, model_query, model_keys, optimizer, pred_meter_pos, pred_meter_neg, loss_meter)
+            if i == ((SAMPLES/BATCH_SIZE) - 1):
                 break
+
+            pbar.set_postfix(loss=loss.numpy(), epoch=epoch, neg=pred_meter_neg.avg, pos=pred_meter_pos.avg, loss_avg=loss_meter.avg, step_time=time.time()-start)
+            pbar.update(1)
+            i += 1
+
+    if epoch == EPOCHS/2:
+        print("Changing learning rate....!")
+        K.set_value(optimizer.lr, 0.002)
+
+    loss_meter.reset()
+    pred_meter_pos.reset()
+    pred_meter_neg.reset()
 
 # train supervised
 model_p = Predictor(model_keys)
@@ -185,4 +208,4 @@ model_p.compile(optimizer='adam',
                 loss=tf.keras.losses.CategoricalCrossentropy(from_logits=False),
                 metrics=['accuracy'])
 
-model_p.fit(train, epochs=EPOCHS)
+model_p.fit(trainset, epochs=EPOCHS)
