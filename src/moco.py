@@ -18,8 +18,33 @@ CLASSES = 8
 IMG_SIZE = 150
 input_shape = (IMG_SIZE, IMG_SIZE, 3)
 BATCH_SIZE = 100
-EPOCHS = 50
+EPOCHS = 25
 SAMPLES = 5000
+
+
+class BatchNormalization(tf.keras.layers.BatchNormalization):
+    """
+    Replace BatchNormalization layers with this new layer.
+    This layer has fixed momentum 0.9 so when we are doing
+    transfer learning on small dataset the learning is a bit faster.
+
+    Usage:
+        tf.keras.layers.BatchNormalization = BatchNormalization
+
+        base_model = tf.keras.applications.MobileNetV2(
+            weights="imagenet", input_shape=self.shape, include_top=False, layers=tf.keras.layers
+        )
+    """
+
+    def __init__(self, momentum=0.9, name=None, **kwargs):
+        super(BatchNormalization, self).__init__(momentum=0.9, name=name, **kwargs)
+
+    def call(self, inputs, training=None):
+        return super().call(inputs=inputs, training=training)
+
+    def get_config(self):
+        config = super(BatchNormalization, self).get_config()
+        return config
 
 
 class AverageMeter(object):
@@ -74,7 +99,7 @@ def _moco_training_step_inner(x, x_aug, queue, model_query, model_keys, temperat
 
     gradients = tape.gradient(loss, model_query.trainable_variables)
     optimizer.apply_gradients(zip(gradients, model_query.trainable_variables))
-    return loss, k, logits
+    return loss, k, logits,
 
 
 def moco_training_step(
@@ -118,16 +143,21 @@ def update_model_via_ema(
 
 
 def Encoder(input_shape):
+    tf.keras.layers.BatchNormalization = BatchNormalization
+
     inputs = tf.keras.Input(shape=input_shape, name="input")
-    model = tf.keras.applications.MobileNetV2(input_shape=input_shape, include_top = False, weights=None)(inputs)
+    model = tf.keras.applications.MobileNetV2(input_shape=input_shape, include_top = False, weights=None, layers=tf.keras.layers)(inputs)
     pool = tf.keras.layers.GlobalAveragePooling2D()(model)
     results = tf.keras.layers.Dense(units = EMBEDDING_DIM, name="embeddings")(pool)
     results = tf.keras.layers.Lambda(lambda  x: tf.keras.backend.l2_normalize(x,axis=1))(results)
     return tf.keras.Model(inputs = inputs, outputs = results)
 
+
 def Predictor(base_model):
-    ouputs = tf.keras.layers.Dense(units = CLASSES, activation="softmax")(base_model.get_layer("embeddings").output)
-    return tf.keras.Model(inputs = base_model.input, outputs = ouputs)
+    outputs = tf.keras.layers.Activation("relu")(base_model.get_layer("embeddings").output)
+    outputs = tf.keras.layers.Dense(units = CLASSES, activation="softmax")(outputs)
+    return tf.keras.Model(inputs = base_model.input, outputs = outputs)
+
 
 @tf.function
 def augment(image, padding = 10, bri = 32./255., sat = (0.5, 1.5), hue = .2, con = (0.5, 1.5)):
@@ -144,7 +174,8 @@ def augment(image, padding = 10, bri = 32./255., sat = (0.5, 1.5), hue = .2, con
     x = tf.math.multiply(tf.math.subtract(x, 0.5), 2.)
     return x
 
-def parse_function(image, label):
+
+def parse_function_moco(image, label):
     data = tf.cast(image, dtype = tf.float32)
     x = (data / 127.5) - 1
     x = tf.image.resize(x, (IMG_SIZE, IMG_SIZE))
@@ -152,20 +183,24 @@ def parse_function(image, label):
     x_aug_2 = augment(x)
     return x_aug_1, x_aug_2, label
 
-def format_example(image, label):
+
+def parse_function_supervised(image, label):
     image = tf.cast(image, tf.float32)
     image = (image/127.5) - 1
     image = tf.image.resize(image, (IMG_SIZE, IMG_SIZE))
+    image = augment(image)
     return image, tf.reduce_sum(tf.one_hot([label], CLASSES), axis=0)
 
-# Load dataset
-trainset = tfds.load(
-            name = 'colorectal_histology',
-            as_supervised=True)['train'].map(format_example).batch(BATCH_SIZE)
 
-trainset_moco = iter(tfds.load(
-            name = 'colorectal_histology',
-            as_supervised=True)['train'].map(parse_function).repeat(EPOCHS).shuffle(SAMPLES, reshuffle_each_iteration=True).batch(BATCH_SIZE).prefetch(200))
+# Load dataset
+trainset, testset = tfds.load(
+            name = 'deep_weeds', #'colorectal_histology', 'deep_weeds'
+            split=['train[:80%]',  'train[80%:]'],
+            as_supervised=True)
+
+trainset_s = trainset.map(parse_function_supervised).batch(BATCH_SIZE)
+testset_s = testset.map(parse_function_supervised).batch(BATCH_SIZE)
+trainset_moco = iter(trainset.map(parse_function_moco).repeat(EPOCHS).shuffle(SAMPLES, reshuffle_each_iteration=True).batch(BATCH_SIZE).prefetch(200))
 
 # Create an instance of the model
 model_query = Encoder(input_shape)
@@ -173,30 +208,38 @@ model_keys = Encoder(input_shape)
 
 # Initialise the models and make the EMA model 90% similar to the main model
 update_model_via_ema(model_query, model_keys, 0.1)
-optimizer = tf.keras.optimizers.SGD(learning_rate=0.02, momentum=0.9, nesterov=True)# weight_decay=1e-5)
 
-queue = MoCoQueue(EMBEDDING_DIM, 1024)
+# init optimizer
+STEPS = len(list(trainset_s))
 
+lr = tf.keras.optimizers.schedules.PolynomialDecay(
+    0.00001, STEPS, end_learning_rate=0.02, power=1.0,
+    cycle=True, name=None
+)
+optimizer = tf.keras.optimizers.SGD(learning_rate=lr, momentum=0.9, nesterov=True)
+
+# Initialize queue with some size
+queue = MoCoQueue(EMBEDDING_DIM, 512)
+
+# Initialize loss metrics watcher
 pred_meter_pos = AverageMeter()
 pred_meter_neg = AverageMeter()
 loss_meter = AverageMeter()
 
 for epoch in range(EPOCHS):
-    with tqdm(total=SAMPLES/BATCH_SIZE, ncols=200) as pbar:
+    with tqdm(total=STEPS, ncols=200) as pbar:
         i = 0
         for x1, x2, y in trainset_moco:
             start = time.time()
             loss = moco_training_step(x1, x2, queue, model_query, model_keys, optimizer, pred_meter_pos, pred_meter_neg, loss_meter)
-            if i == ((SAMPLES/BATCH_SIZE) - 1):
+
+            pbar.set_postfix(loss=loss.numpy(), epoch=epoch, lr=optimizer.learning_rate(optimizer.iterations).numpy(), neg=pred_meter_neg.avg, pos=pred_meter_pos.avg, loss_avg=loss_meter.avg, step_time=time.time()-start)
+            pbar.update(1)
+
+            if i == (STEPS - 1):
                 break
 
-            pbar.set_postfix(loss=loss.numpy(), epoch=epoch, neg=pred_meter_neg.avg, pos=pred_meter_pos.avg, loss_avg=loss_meter.avg, step_time=time.time()-start)
-            pbar.update(1)
             i += 1
-
-    if epoch == EPOCHS/2:
-        print("Changing learning rate....!")
-        K.set_value(optimizer.lr, 0.002)
 
     loss_meter.reset()
     pred_meter_pos.reset()
@@ -208,4 +251,4 @@ model_p.compile(optimizer='adam',
                 loss=tf.keras.losses.CategoricalCrossentropy(from_logits=False),
                 metrics=['accuracy'])
 
-model_p.fit(trainset, epochs=EPOCHS)
+model_p.fit(trainset_s, validation_data=testset_s, epochs=EPOCHS)
